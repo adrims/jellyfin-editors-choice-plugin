@@ -19,23 +19,15 @@ namespace EditorsChoicePlugin.Api;
 [Route("editorschoice")]
 public class EditorsChoiceActivityController : ControllerBase
 {
-
-    private readonly PluginConfiguration _config;
-    private readonly IUserManager _userManager;
-    private readonly ILibraryManager _libraryManager;
     private readonly ILogger<EditorsChoiceActivityController> _logger;
+    private readonly PluginConfiguration _config;
     private readonly string _scriptPath;
 
-    public EditorsChoiceActivityController(IUserManager userManager, ILibraryManager libraryManager, ILogger<EditorsChoiceActivityController> logger)
+    public EditorsChoiceActivityController(ILogger<EditorsChoiceActivityController> logger)
     {
-        _userManager = userManager;
-        _libraryManager = libraryManager;
         _logger = logger;
-
         _config = Plugin.Instance!.Configuration;
-
         _scriptPath = GetType().Namespace + ".client.js";
-
         _logger.LogInformation("EditorsChoiceActivityController loaded.");
     }
 
@@ -45,14 +37,8 @@ public class EditorsChoiceActivityController : ControllerBase
     [Produces("application/javascript")]
     public ActionResult GetClientScript()
     {
-        var scriptStream = Assembly.GetExecutingAssembly().GetManifestResourceStream(_scriptPath);
-
-        if (scriptStream != null)
-        {
-            return File(scriptStream, "application/javascript");
-        }
-
-        return NotFound();
+        var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(_scriptPath);
+        return stream is not null ? File(stream, "application/javascript") : NotFound();
     }
 
     [HttpGet("favourites")]
@@ -61,11 +47,12 @@ public class EditorsChoiceActivityController : ControllerBase
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     [Produces(MediaTypeNames.Application.Json)]
-    public ActionResult<Dictionary<string, object>> GetFavourites()
+    public ActionResult<Dictionary<string, object>> GetFavourites(
+        [FromServices] IUserManager userManager,
+        [FromServices] ILibraryManager libraryManager)
     {
         try
         {
-
             Dictionary<string, object> response;
             List<object> items;
             InternalItemsQuery query;
@@ -75,165 +62,107 @@ public class EditorsChoiceActivityController : ControllerBase
             int? maximumParentRating = null;
             bool? mustHaveParentRating = null;
 
-            // Get active user - haven't found a better way than this
-            string name = "";
-            if (User.Identity != null)
-            {
-                if (User.Identity.Name != null)
-                {
-                    name = User.Identity.Name;
-                }
-            }
+            // Active user
+            var name = User?.Identity?.Name ?? string.Empty;
+            var activeUser = userManager.GetUserByName(name);
+            if (activeUser is null) return NotFound();
 
-            Jellyfin.Data.Entities.User? activeUser = _userManager.GetUserByName(name);
-            if (activeUser == null) return NotFound();
-
-            // If the config is set to be user profile specific, then we need to set the rating to the user's max age rating.
+            // Parental rating logic
             if (_config.MaximumParentRating == -2)
             {
                 maximumParentRating = activeUser.MaxParentalAgeRating;
-                if (maximumParentRating >= 0)
-                {
-                    mustHaveParentRating = true; // we want to avoid showing unrated content when a user has a parental access limitation
-                }
+                if (maximumParentRating >= 0) mustHaveParentRating = true;
             }
             else
             {
                 maximumParentRating = _config.MaximumParentRating;
-                mustHaveParentRating = true; // we want to avoid showing unrated content when a user has a parental access limitation
+                mustHaveParentRating = true;
             }
 
-            // If not showing random media, collect the editor user's favourited items
+            // FAVOURITES mode
             if (_config.Mode == "FAVOURITES")
             {
-
-                // Use random fallback if no editor ID set
-                if (_config.EditorUserId == null || _config.EditorUserId == "" || _config.EditorUserId.Length < 16)
+                if (string.IsNullOrWhiteSpace(_config.EditorUserId) || _config.EditorUserId.Length < 16)
                 {
                     resultsEmpty = true;
                 }
                 else
                 {
-                    Jellyfin.Data.Entities.User? editorUser = _userManager.GetUserById(Guid.Parse(_config.EditorUserId));
-
-                    // Get the favourites list
+                    var editorUser = userManager.GetUserById(Guid.Parse(_config.EditorUserId));
                     query = new InternalItemsQuery(editorUser)
                     {
                         IsFavorite = true,
                         IncludeItemsByName = true,
-                        IncludeItemTypes = [BaseItemKind.Series, BaseItemKind.Movie, BaseItemKind.Episode, BaseItemKind.Season], // Editor may have favourited individual episodes or seasons - we will handle this later
+                        IncludeItemTypes = [BaseItemKind.Series, BaseItemKind.Movie, BaseItemKind.Episode, BaseItemKind.Season],
                         MinCommunityRating = _config.MinimumRating,
                         MinCriticRating = _config.MinimumCriticRating,
                         MaxParentalRating = maximumParentRating,
                         HasParentalRating = mustHaveParentRating,
-                        OrderBy = new[] { (ItemSortBy.Random, SortOrder.Ascending) }
+                        OrderBy = new[] { (ItemSortBy.Random, SortOrder.Ascending) },
+                        Limit = _config.RandomMediaCount * 2
                     };
-                    query.Limit = _config.RandomMediaCount * 2;
-                    initialResult = _libraryManager.GetItemList(query);
+                    initialResult = libraryManager.GetItemList(query);
 
-                    // Get ids of items in the favourites list
-                    List<Guid> itemIds = new List<Guid>();
-                    foreach (var item in initialResult)
-                    {
-                        if (!itemIds.Contains(item.Id))
-                        {
-                            // Only include if active user has parental access to this item
-                            if (item.IsVisible(activeUser))
-                            {
-                                itemIds.Add(item.Id);
-                            }
-                        }
-                    }
+                    // IDs visible to active user
+                    var itemIds = new HashSet<Guid>(
+                        initialResult.Where(i => i.IsVisible(activeUser)).Select(i => i.Id));
 
-                    // Query items from the active user to ensure access
                     query = new InternalItemsQuery(activeUser)
                     {
                         ItemIds = [.. itemIds],
-                        IncludeItemTypes = [BaseItemKind.Series, BaseItemKind.Movie, BaseItemKind.Episode, BaseItemKind.Season], // Editor may have favourited individual episodes or seasons - we will handle this later
+                        IncludeItemTypes = [BaseItemKind.Series, BaseItemKind.Movie, BaseItemKind.Episode, BaseItemKind.Season],
                         IsPlayed = _config.ShowPlayed ? null : false
                     };
-                    result = PrepareResult(query, activeUser);
-
-                    // If the result is empty (i.e. the active user doesn't have access to any of the items), fallback to random mode.
+                    result = PrepareResult(query, activeUser, libraryManager);
                     resultsEmpty = result.Count == 0;
                 }
-
             }
 
+            // COLLECTIONS mode
             if (_config.Mode == "COLLECTIONS")
             {
-                List<String> remainingCollections = _config.SelectedCollections.ToList();
-
-                while (result.Count == 0 && remainingCollections.Count > 0)
-                { // if a collection is totally inaccessible due to user visibility or excessive filters configured, we need to try another collection
-                    int collectionR = new Random().Next(remainingCollections.Count);
-                    string collectionId = remainingCollections[collectionR];
-                    remainingCollections.RemoveAt(collectionR);
-                    Guid collectionGuid = Guid.Parse(collectionId);
-
-                    BaseItem collection = _libraryManager.GetParentItem(collectionGuid, activeUser.Id);
-                    if (collection is Folder)
+                var remaining = _config.SelectedCollections.ToList();
+                while (result.Count == 0 && remaining.Count > 0)
+                {
+                    var collectionGuid = Guid.Parse(remaining[new Random().Next(remaining.Count)]);
+                    remaining.Remove(collectionGuid.ToString());
+                    var collection = libraryManager.GetParentItem(collectionGuid, activeUser.Id);
+                    if (collection is Folder f)
                     {
-                        Folder f = (Folder)collection;
                         initialResult = f.GetChildren(activeUser, true);
-
-                        // Get ids of items in the collection
-                        List<Guid> itemIds = new List<Guid>();
-                        foreach (var item in initialResult)
+                        var itemIds = initialResult.Select(i => i.Id).Distinct().ToArray();
+                        var q = new InternalItemsQuery(activeUser)
                         {
-                            if (!itemIds.Contains(item.Id))
-                            {
-                                itemIds.Add(item.Id);
-                            }
-                        }
-
-                        query = new InternalItemsQuery(activeUser)
-                        {
-                            ItemIds = [.. itemIds],
+                            ItemIds = itemIds,
                             IncludeItemTypes = [BaseItemKind.Series, BaseItemKind.Movie],
                             MinCommunityRating = _config.MinimumRating,
                             MinCriticRating = _config.MinimumCriticRating,
                             MaxParentalRating = maximumParentRating,
                             HasParentalRating = mustHaveParentRating,
                             OrderBy = new[] { (ItemSortBy.Random, SortOrder.Ascending) },
-                            IsPlayed = _config.ShowPlayed ? null : false
+                            IsPlayed = _config.ShowPlayed ? null : false,
+                            Limit = _config.RandomMediaCount * 2
                         };
-                        query.Limit = _config.RandomMediaCount * 2;
-                        result = PrepareResult(query, activeUser);
+                        result = PrepareResult(q, activeUser, libraryManager);
                     }
-
-                    // If the result is empty (i.e. the active user doesn't have access to any of the items), fallback to random mode.
                     resultsEmpty = result.Count == 0;
                 }
             }
 
+            // NEW mode
             if (_config.Mode == "NEW")
             {
-                DateTime newEndDate = DateTime.Today.AddMonths(-1);
-
-                switch (_config.NewTimeLimit)
+                DateTime newEndDate = _config.NewTimeLimit switch
                 {
-                    case "1month":
-                        newEndDate = DateTime.Today.AddMonths(-1);
-                        break;
-                    case "2month":
-                        newEndDate = DateTime.Today.AddMonths(-2);
-                        break;
-                    case "6month":
-                        newEndDate = DateTime.Today.AddMonths(-6);
-                        break;
-                    case "1year":
-                        newEndDate = DateTime.Today.AddYears(-1);
-                        break;
-                    case "2year":
-                        newEndDate = DateTime.Today.AddYears(-2);
-                        break;
-                    case "5year":
-                        newEndDate = DateTime.Today.AddYears(-5);
-                        break;
-                }
+                    "2month" => DateTime.Today.AddMonths(-2),
+                    "6month" => DateTime.Today.AddMonths(-6),
+                    "1year"  => DateTime.Today.AddYears(-1),
+                    "2year"  => DateTime.Today.AddYears(-2),
+                    "5year"  => DateTime.Today.AddYears(-5),
+                    _        => DateTime.Today.AddMonths(-1)
+                };
 
-                InternalItemsQuery queryItems = new InternalItemsQuery(activeUser)
+                var qItems = new InternalItemsQuery(activeUser)
                 {
                     IncludeItemTypes = [BaseItemKind.Series],
                     MinCommunityRating = _config.MinimumRating,
@@ -242,12 +171,12 @@ public class EditorsChoiceActivityController : ControllerBase
                     HasParentalRating = mustHaveParentRating,
                     MinEndDate = newEndDate,
                     OrderBy = new[] { (ItemSortBy.Random, SortOrder.Ascending) },
-                    IsPlayed = _config.ShowPlayed ? null : false
+                    IsPlayed = _config.ShowPlayed ? null : false,
+                    Limit = _config.RandomMediaCount
                 };
-                queryItems.Limit = _config.RandomMediaCount;
-                List<BaseItem> resultItems = PrepareResult(queryItems, activeUser);
+                var resultItems = PrepareResult(qItems, activeUser, libraryManager);
 
-                InternalItemsQuery queryMovies = new InternalItemsQuery(activeUser)
+                var qMovies = new InternalItemsQuery(activeUser)
                 {
                     IncludeItemTypes = [BaseItemKind.Movie],
                     MinCommunityRating = _config.MinimumRating,
@@ -256,21 +185,18 @@ public class EditorsChoiceActivityController : ControllerBase
                     HasParentalRating = mustHaveParentRating,
                     MinPremiereDate = newEndDate,
                     OrderBy = new[] { (ItemSortBy.Random, SortOrder.Ascending) },
-                    IsPlayed = _config.ShowPlayed ? null : false
+                    IsPlayed = _config.ShowPlayed ? null : false,
+                    Limit = _config.RandomMediaCount
                 };
-                queryMovies.Limit = _config.RandomMediaCount;
-                List<BaseItem> resultMovies = PrepareResult(queryMovies, activeUser);
+                var resultMovies = PrepareResult(qMovies, activeUser, libraryManager);
 
                 result = resultItems.Concat(resultMovies).ToList();
-
                 resultsEmpty = result.Count == 0;
             }
 
-            // If showing random media is enabled OR the results list is currently empty, collect a random selection from the entire library
+            // RANDOM or fallback
             if (_config.Mode == "RANDOM" || resultsEmpty)
             {
-
-                // Get all shows and movies
                 query = new InternalItemsQuery(activeUser)
                 {
                     IncludeItemTypes = [BaseItemKind.Series, BaseItemKind.Movie],
@@ -279,116 +205,88 @@ public class EditorsChoiceActivityController : ControllerBase
                     MaxParentalRating = maximumParentRating,
                     HasParentalRating = mustHaveParentRating,
                     OrderBy = new[] { (ItemSortBy.Random, SortOrder.Ascending) },
-                    IsPlayed = _config.ShowPlayed ? null : false
+                    IsPlayed = _config.ShowPlayed ? null : false,
+                    Limit = _config.RandomMediaCount * 2
                 };
-                query.Limit = _config.RandomMediaCount * 2;
-                result = PrepareResult(query, activeUser);
+                result = PrepareResult(query, activeUser, libraryManager);
             }
 
             // Build response
-            response = new Dictionary<string, object>();
             items = new List<object>();
-
-            foreach (BaseItem i in result)
+            foreach (var item in result)
             {
-                BaseItem item = i;
-
-                // Narrow down properties that are strictly necessary to pass through to frontend
-                Dictionary<string, object> itemObject = new Dictionary<string, object>
+                var o = new Dictionary<string, object?>
                 {
-                    { "id", item.Id.ToString() },
-                    { "name", item.Name },
-                    { "tagline", item.Tagline },
-                    { "official_rating", item.OfficialRating },
-                    { "hasLogo", item.HasImage(MediaBrowser.Model.Entities.ImageType.Logo) }
+                    ["id"] = item.Id.ToString(),
+                    ["name"] = item.Name,
+                    ["tagline"] = item.Tagline,
+                    ["official_rating"] = item.OfficialRating,
+                    ["hasLogo"] = item.HasImage(MediaBrowser.Model.Entities.ImageType.Logo)
                 };
 
-                if (_config.ShowDescription)
-                {
-                    itemObject.Add("overview", item.Overview);
-                }
-                if (item.CriticRating.HasValue && _config.ShowRating)
-                {
-                    itemObject.Add("critic_rating", item.CriticRating);
-                }
-                if (item.CommunityRating.HasValue && _config.ShowRating)
-                {
-                    itemObject.Add("community_rating", Math.Round(Convert.ToDecimal(item.CommunityRating), 2));
-                }
+                if (_config.ShowDescription) o["overview"] = item.Overview;
+                if (_config.ShowRating && item.CriticRating.HasValue)   o["critic_rating"] = item.CriticRating;
+                if (_config.ShowRating && item.CommunityRating.HasValue) o["community_rating"] = Math.Round((decimal)item.CommunityRating.Value, 2);
 
-                items.Add(itemObject);
+                items.Add(o);
             }
 
-            response.Add("favourites", items);
-            response.Add("autoplay", _config.EnableAutoplay);
-            response.Add("autoplayInterval", _config.AutoplayInterval * 1000);
-            response.Add("reduceImageSizes", _config.ReduceImageSize);
-            response.Add("bannerHeight", _config.BannerHeight);
-            if (_config.Heading != null) response.Add("heading", _config.Heading);
+            response = new Dictionary<string, object>
+            {
+                ["favourites"] = items,
+                ["autoplay"] = _config.EnableAutoplay,
+                ["autoplayInterval"] = _config.AutoplayInterval * 1000,
+                ["reduceImageSizes"] = _config.ReduceImageSize,
+                ["bannerHeight"] = _config.BannerHeight
+            };
+            if (!string.IsNullOrWhiteSpace(_config.Heading)) response["heading"] = _config.Heading;
 
             return Ok(response);
-
         }
         catch (Exception e)
         {
-            _logger.LogError(e.ToString());
+            _logger.LogError(e, "EditorsChoice: favourites error");
             return StatusCode(503);
         }
-
     }
 
-    private List<BaseItem> PrepareResult(InternalItemsQuery query, Jellyfin.Data.Entities.User? activeUser)
+    private List<BaseItem> PrepareResult(
+        InternalItemsQuery query,
+        Jellyfin.Data.Entities.User? activeUser,
+        ILibraryManager libraryManager)
     {
-        List<BaseItem> initialResult = _libraryManager.GetItemList(query);
-        List<BaseItem> result = [];
-
-        // Randomly add items until we run out or reach the admin-set cap
+        var initialResult = libraryManager.GetItemList(query);
+        var result = new List<BaseItem>();
         var random = new Random();
-        int max = initialResult.Count;
+        var max = initialResult.Count;
 
         for (int i = 0; i < _config.RandomMediaCount && i < max; i++)
         {
-            BaseItem initItem = initialResult[random.Next(initialResult.Count)];
-            var shiftItem = initItem;
+            var initItem = initialResult[random.Next(initialResult.Count)];
+            var item = initItem;
 
-            // Deal with episodes or seasons
-            if (shiftItem.GetBaseItemKind() == BaseItemKind.Episode || shiftItem.GetBaseItemKind() == BaseItemKind.Season)
+            if (item.GetBaseItemKind() is BaseItemKind.Episode or BaseItemKind.Season)
             {
-                shiftItem = shiftItem.GetParent();
-
-                // If the parent is a season (i.e. the favourited item was an episode) then we need to get the season's parent show
-                if (shiftItem.GetBaseItemKind() == BaseItemKind.Season)
-                {
-                    shiftItem = shiftItem.GetParent();
-                }
+                item = item.GetParent();
+                if (item.GetBaseItemKind() == BaseItemKind.Season)
+                    item = item.GetParent();
             }
 
-            // Check is in an allowed library
-            bool inFilteredLibrary = false;
-            if (_config.FilteredLibraries.Length == 0)
-            {
-                inFilteredLibrary = true; // If no libraries are selected, then we default to all libraries
-            }
-            else
-            {
-                foreach (String filteredLibraryId in _config.FilteredLibraries)
-                {
-                    if (shiftItem.GetAncestorIds().Contains(Guid.Parse(filteredLibraryId)))
-                    {
-                        inFilteredLibrary = true;
-                    }
-                }
-            }
+            var inFilteredLibrary =
+                _config.FilteredLibraries.Length == 0 ||
+                _config.FilteredLibraries.Any(id => item.GetAncestorIds().Contains(Guid.Parse(id)));
 
-            // Only include if active user has parental access to this item, not already in the results, if only unplayed items should be shown & this is unplayed, and if has a backdrop image
-            if (shiftItem.IsVisible(activeUser) && !result.Contains(shiftItem) && inFilteredLibrary && !(shiftItem.IsPlayed(activeUser) && !_config.ShowPlayed) && shiftItem.HasImage(MediaBrowser.Model.Entities.ImageType.Backdrop))
+            if (item.IsVisible(activeUser)
+                && !result.Contains(item)
+                && inFilteredLibrary
+                && !(! _config.ShowPlayed && item.IsPlayed(activeUser))
+                && item.HasImage(MediaBrowser.Model.Entities.ImageType.Backdrop))
             {
-                result.Add(shiftItem);
+                result.Add(item);
             }
             else
             {
-                i--; // reset increment so we make up for non-inclusion
-                max--;
+                i--; max--;
             }
             initialResult.Remove(initItem);
         }
@@ -396,28 +294,20 @@ public class EditorsChoiceActivityController : ControllerBase
         return result;
     }
 
-
     [HttpPost("transform")]
     public ActionResult IndexTransformation([FromBody] PatchRequestPayload payload)
     {
-        NetworkConfiguration networkConfiguration = Plugin.Instance!.ServerConfigurationManager.GetNetworkConfiguration();
-
-        string basePath = "";
-        if (!string.IsNullOrWhiteSpace(networkConfiguration.BaseUrl))
-        {
-            basePath = $"/{networkConfiguration.BaseUrl.TrimStart('/').Trim()}";
-        }
-
-        string script = $"<script FileTransformation=\"true\" plugin=\"EditorsChoice\" defer=\"defer\" src=\"{basePath}/EditorsChoice/script\"></script>";
-
-        string text = Regex.Replace(payload.Contents!, "(</body>)", $"{script}$1");
-
-        return Content(text, MediaTypeNames.Text.Html);
+        var net = Plugin.Instance!.ServerConfigurationManager.GetNetworkConfiguration();
+        var basePath = string.IsNullOrWhiteSpace(net.BaseUrl) ? "" : "/" + net.BaseUrl.Trim('/');
+        // use the same lower-case route as this controller
+        var script = $"<script FileTransformation=\"true\" plugin=\"EditorsChoice\" defer=\"defer\" src=\"{basePath}/editorschoice/script\"></script>";
+        var html = Regex.Replace(payload?.Contents ?? string.Empty, "(</body>)", $"{script}$1", RegexOptions.IgnoreCase);
+        return Content(html, MediaTypeNames.Text.Html);
     }
 }
 
 public class PatchRequestPayload
-    {
-        [JsonPropertyName("contents")]
-        public string? Contents { get; set; }
-    }
+{
+    [JsonPropertyName("contents")]
+    public string? Contents { get; set; }
+}
