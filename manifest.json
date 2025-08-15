@@ -1,18 +1,18 @@
 [
     {
         "guid": "70bb2ec1-f19e-46b5-b49a-942e6b96ebae",
-        "name": "Editor's Choice",
-        "overview": "Create a Netflix-style featured content slider on the main page.",
-        "description": "Create a Netflix-style featured content slider on the main page.",
+        "name": "Editor's Choice - Fix",
+        "overview": "Create a Netflix-style featured content slider on the main page. Race condition fixed",
+        "description": "Create a Netflix-style featured content slider on the main page. Race condition dixed",
         "owner": "lachlandcp",
         "category": "General",
-        "imageUrl": "https://raw.githubusercontent.com/lachlandcp/jellyfin-editors-choice-plugin/main/logo.png",
+        "imageUrl": "https://raw.githubusercontent.com/adrims/jellyfin-editors-choice-plugin/main/cuidaito_avatar.jpg",
         "versions": [
             {
-                "version": "1.1.0.1",
+                "version": "1.3.2.1",
                 "changelog": "Manage race condition on first load",
                 "targetAbi": "10.10.7.0",
-                "sourceUrl": "https://github.com/adrims/jellyfin-editors-choice-plugin/releases/download/v1.1.0.1/EditorChoicePlugin-1.1.0.1.zip",
+                "sourceUrl": "https://github.com/adrims/jellyfin-editors-choice-plugin/releases/download/v1.3.2.1/EditorChoicePlugin-1.3.2.1.zip",
                 "checksum": "B378FE0E0BB4035E1C19BD23D4CF595F",
                 "timestamp": "2025-08-15T22:59:00Z"
             }
